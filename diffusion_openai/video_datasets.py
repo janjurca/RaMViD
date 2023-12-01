@@ -6,6 +6,8 @@ import numpy as np
 from torch.utils.data import DataLoader, Dataset
 import torch
 import av
+import glob
+from os import path
 
 def load_data(
     *, data_dir, batch_size, image_size, class_cond=False, deterministic=False, rgb=True, seq_len=20
@@ -58,6 +60,15 @@ def load_data(
             rgb=rgb,
             seq_len=seq_len
         )
+    elif entry in ["jpg", "png"]:
+        dataset = VideoImageDataset(
+            image_size,
+            all_files,
+            classes=classes,
+            shard=MPI.COMM_WORLD.Get_rank(),
+            num_shards=MPI.COMM_WORLD.Get_size(),
+            rgb=rgb,
+        )
     if deterministic:
         loader = DataLoader(
             dataset, batch_size=batch_size, shuffle=False, num_workers=16, drop_last=True
@@ -75,7 +86,7 @@ def _list_video_files_recursively(data_dir):
     for entry in sorted(bf.listdir(data_dir)):
         full_path = bf.join(data_dir, entry)
         ext = entry.split(".")[-1]
-        if "." in entry and ext.lower() in ["gif", "avi", "mp4"]:
+        if "." in entry and ext.lower() in ["gif", "avi", "mp4", "jpg", "png"]:
             results.append(full_path)
         elif bf.isdir(full_path):
             results.extend(_list_video_files_recursively(full_path))
@@ -190,3 +201,82 @@ class VideoDataset_gif(Dataset):
         if self.local_classes is not None:
             out_dict["y"] = np.array(self.local_classes[idx], dtype=np.int64)
         return arr_seq, out_dict
+
+
+class VideoImageDataset(Dataset):
+    def __init__(self, resolution, video_paths, classes=None, shard=0, num_shards=1, rgb=True, seq_len=20):
+        super().__init__()
+        assert classes is None or classes is False
+        self.resolution = resolution
+        self.local_videos = video_paths[shard:][::num_shards]
+        self.local_classes = None if classes is None else classes[shard:][::num_shards]
+        self.rgb = rgb
+        self.seq_len = seq_len
+
+        tiles = {}
+        for f in sorted(self.local_videos):
+            tile = f.split("/")[-2]
+            if tile not in tiles:
+                tiles[tile] = []
+            tiles[tile].append(f)
+        
+        self.sequences = []
+        diference = 600
+        for tile in tiles:
+            for i, file in enumerate(tiles[tile]):
+                sequence = []
+                file_timestamp = int(path.basename(file).split(".")[0])
+                for j, file2 in enumerate(tiles[tile][i+1:]):
+                    file2_timestamp = int(path.basename(file2).split(".")[0])
+                    if file2_timestamp == file_timestamp+(j+1)*diference:
+                        sequence.append(file2)
+                    else:
+                        break
+                    if len(sequence) == self.seq_len:
+                        break
+                if len(sequence) == self.seq_len:
+                    self.sequences.append(tuple(sequence))
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        sequence = self.sequences[idx]
+        arr_seq = []
+        
+        arr_list = []
+        for i, file in enumerate(sequence):
+            with Image.open(file) as img:
+                #img = img.resize((self.resolution,self.resolution))
+                while min(*img.size) >= 2 * self.resolution:
+                    img = img.resize(
+                        tuple(x // 2 for x in img.size), resample=Image.BOX
+                    )
+                scale = self.resolution / min(*img.size)
+                img =img.resize(
+                    tuple(round(x * scale) for x in img.size), resample=Image.BICUBIC
+                )
+
+                if self.rgb:    
+                    arr = np.array(img.convert("RGB"))
+                else:
+                    arr = np.array(img.convert("L"))
+                    arr = np.expand_dims(arr, axis=2)
+
+                crop_y = (arr.shape[0] - self.resolution) // 2
+                crop_x = (arr.shape[1] - self.resolution) // 2
+                arr = arr[crop_y : crop_y + self.resolution, crop_x : crop_x + self.resolution]
+                arr = arr.astype(np.float32) / 127.5 - 1
+                arr_list.append(arr)
+                
+        arr_seq = np.array(arr_list)
+        arr_seq = np.transpose(arr_seq, [3, 0, 1, 2])
+
+        if arr_seq.shape[1] > self.seq_len:
+            start = np.random.randint(0, arr_seq.shape[1]-self.seq_len)
+            arr_seq = arr_seq[:,start:start + self.seq_len]
+        out_dict = {}
+        if self.local_classes is not None:
+            out_dict["y"] = np.array(self.local_classes[idx], dtype=np.int64)
+        return arr_seq, out_dict
+

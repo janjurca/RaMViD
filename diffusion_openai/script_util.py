@@ -33,7 +33,7 @@ def model_and_diffusion_defaults():
         use_checkpoint=False,
         use_scale_shift_norm=True,
         scale_time_dim=20,
-        rgb=True
+        rgb=False
     )
 
 

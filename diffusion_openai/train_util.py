@@ -149,11 +149,15 @@ class TrainLoop:
 
             # if dist.get_rank() == 0:
             logger.log(f"loading model from checkpoint: {resume_checkpoint}...")
-            self.model.load_state_dict(
-                dist_util.load_state_dict(
+            state_dict = dist_util.load_state_dict(
                     resume_checkpoint, map_location=dist_util.dev()
                 )
-            )
+            del state_dict["input_blocks.0.0.weight"]
+            del state_dict["out.2.weight"]
+            del state_dict["out.2.bias"]
+            
+            
+            self.model.load_state_dict(state_dict, strict=False)
 
 
         dist_util.sync_params(self.model.parameters())
